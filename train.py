@@ -1,121 +1,143 @@
-# -*- coding: utf-8 -*-
-import os
+import argparse
+import collections
 import torch
-from config import parse_config
-from data_loader import DataBatchIterator
-from data_loader import PAD
-from model import TextCNN
-from torch.optim import Adam
-from torch.nn import CrossEntropyLoss
-import logging
+import numpy as np
+# import data_process.data_loaders as module_data
+from data_process import data_process as module_data_process
+from torch.utils.data import dataloader as module_data_loader
+from base import base_dataset
+import model.loss as module_loss
+import model.metric as module_metric
+import model.model as module_arch
+from parse_config import ConfigParser
+from trainer import Trainer, BertTrainer
+import transformers as optimization
+import os
+
+# fix random seeds for reproducibility
+SEED = 123
+torch.manual_seed(SEED)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+np.random.seed(SEED)
 
 
-def build_textcnn_model(vocab, config, train=True):
-    model = TextCNN(vocab.vocab_size, config)
-    if train:
-        model.train()
+def main(config, use_transformers):
+    logger = config.get_logger('train')
+    device = torch.device('cuda:{}'.format(
+        config.config['device_id']) if config.config['n_gpu'] > 0 else 'cpu')
+
+    # setup data_set, data_process instances
+    dataset = config.init_obj('dataset', module_data_process, device=device)
+
+    # build model architecture, then print to console
+    model = config.init_obj('model_arch', module_arch,
+                            word_embedding=dataset.word_embedding)
+    logger.info(model)
+
+    # get function handles of loss and metrics
+    criterion = [getattr(module_loss, crit) for crit in config['loss']]
+    metrics = [getattr(module_metric, met) for met in config['metrics']]
+
+    if use_transformers:
+        # build optimizer, learning rate scheduler. delete every lines containing lr_scheduler for disabling scheduler
+        if 'bert' in config.config['model_arch']['type'].lower():
+            transformers_params = [
+                *filter(lambda p: p.requires_grad, model.bert.parameters())]
+            other_params = [*filter(lambda p: p.requires_grad,
+                                    [param for name, param in model.named_parameters() if 'bert' not in name])]
+
+        if 'xlnet' in config.config['model_arch']['type'].lower():
+            transformers_params = [*filter(lambda p: p.requires_grad, [
+                                           param for name, param in model.named_parameters() if 'xlnet' in name])]
+            other_params = [*filter(lambda p: p.requires_grad,
+                                    [param for name, param in model.named_parameters() if 'xlnet' not in name])]
+        # bert的优化器略有不同
+        train_dataloader = config.init_obj('data_loader', module_data_loader, dataset=dataset.train_set,
+                                           collate_fn=dataset.bert_collate_fn)
+        valid_dataloader = config.init_obj('data_loader', module_data_loader, dataset=dataset.test_set,
+                                           collate_fn=dataset.bert_collate_fn)
+
+        optimizer = config.init_obj('optimizer', optimization, [
+            {"params": transformers_params, 'lr': 5e-5, "weight_decay": 0},
+            {"params": other_params, 'lr': 1e-3, "weight_decay": 0},
+        ])
+        lr_scheduler = config.init_obj('lr_scheduler', optimization.optimization, optimizer,
+                                       num_training_steps=int(
+                                           len(train_dataloader.dataset) / train_dataloader.batch_size))
     else:
-        model.eval()
+        # build optimizer, learning rate scheduler. delete every lines containing lr_scheduler for disabling scheduler
+        trainable_params = [
+            *filter(lambda p: p.requires_grad, model.parameters())]
+        train_dataloader = config.init_obj('data_loader', module_data_loader, dataset=dataset.train_set,
+                                           collate_fn=dataset.collate_fn)
+        valid_dataloader = config.init_obj('data_loader', module_data_loader, dataset=dataset.test_set,
+                                           collate_fn=dataset.collate_fn)
+        optimizer = config.init_obj('optimizer', torch.optim, trainable_params)
+        lr_scheduler = config.init_obj(
+            'lr_scheduler', torch.optim.lr_scheduler, optimizer)
 
-    if torch.cuda.is_available():
-        model.cuda()
+    trainer = Trainer(model, criterion, metrics, optimizer,
+                      config=config,
+                      train_iter=train_dataloader,
+                      valid_iter=valid_dataloader,
+                      lr_scheduler=lr_scheduler)
+
+    trainer.train()
+
+
+def run(config_file):
+    args = argparse.ArgumentParser(description='text classification')
+    args.add_argument('-c', '--config', default=config_file, type=str,
+                      help='config file path (default: None)')
+    args.add_argument('-r', '--resume', default=None, type=str,
+                      help='path to latest checkpoint (default: None)')
+    args.add_argument('-d', '--device', default='0,1', type=str,
+                      help='indices of GPUs to enable (default: all)')
+
+    # custom cli options to modify configuration from default values given in json file.
+    CustomArgs = collections.namedtuple('CustomArgs', 'flags type target')
+    options = [
+        CustomArgs(['--lr', '--learning_rate'],
+                   type=float, target='optimizer;args;lr'),
+        CustomArgs(['--bs', '--batch_size'], type=int,
+                   target='data_process;args;batch_size')
+    ]
+    config = ConfigParser.from_args(args, options)
+    print(config.config['model_arch']['type'].lower())
+
+    # 是否使用bert作为预训练模型
+    if 'bert' in config.config['model_arch']['type'].lower() or 'xlnet' in config.config['model_arch']['type'].lower():
+        main(config, use_transformers=True)
     else:
-        model.cpu()
-    return model
+        main(config, use_transformers=False)
 
 
-def train_textcnn_model(model, train_data, valid_data, padding_idx, config):
-    # Build optimizer.
-    # params = [p for k, p in model.named_parameters(
-    # ) if p.requires_grad and "embed" not in k]
-    params = [p for k, p in model.named_parameters() if p.requires_grad]
-    optimizer = Adam(params, lr=config.lr)
-    criterion = CrossEntropyLoss(reduction="sum")
-    model.train()
+if __name__ == '__main__':
+    # ---------------------------------------微博情感二分类-------------------------------------------------
+    # run('configs/binary_classification/fast_text_config.json')
+    # run('configs/binary_classification/text_cnn_config.json')
+    # run('configs/binary_classification/text_cnn_1d_config.json')
+    # run('configs/binary_classification/rnn_config.json')
+    # run('configs/binary_classification/lstm_config.json')
+    # run('configs/binary_classification/gru_config.json')
+    # run('configs/binary_classification/rcnn_config.json')
+    # run('configs/binary_classification/rnn_attention_config.json')
+    # run('configs/binary_classification/dpcnn_config.json')
+    # run('configs/binary_classification/bert_config.json')
+    # run('configs/binary_classification/bert_rnn_config.json')
+    # run('configs/binary_classification/bert_rcnn_config.json')
+    # run('configs/binary_classification/bert_cnn_config.json')
+    # ---------------------------------------cnews 十分类-------------------------------------------------
 
-    for epoch in range(1, config.epochs + 1):
-        train_data_iter = iter(train_data)
-        for idx, batch in enumerate(train_data_iter):
-            model.zero_grad()
-            ground_truth = batch.label
-            # batch_first = False
-            outputs = model(batch.sent)
-            loss = criterion(outputs, ground_truth)
-            loss.backward()
-            optimizer.step()
-
-            if idx % 20 == 0:
-                valid_loss = valid_textcnn_model(
-                    model, valid_data, criterion, config)
-                # 处理
-                print("epoch {0:d} [{1:d}/{2:d}], valid loss: {3:.2f}".format(
-                    epoch, idx, train_data.num_batches, valid_loss))
-                model.train()
-
-
-def valid_textcnn_model(model,  valid_data, criterion, config):
-    # Build optimizer.
-    # params = [p for k, p in model.named_parameters(
-    # ) if p.requires_grad and "embed" not in k]
-    model.eval()
-    total_loss = 0
-    valid_data_iter = iter(valid_data)
-    for idx, batch in enumerate(valid_data_iter):
-        model.zero_grad()
-        ground_truth = batch.label
-        # batch_first = False
-        outputs = model(batch.sent)
-        # probs = model.generator(decoder_outputs)
-        loss = criterion(outputs, batch.label)
-        # loss 打印
-        # 处理
-        total_loss += loss
-        # break
-    return total_loss
-
-
-def main():
-    # 读配置文件
-    config = parse_config()
-    # 载入训练集合
-    train_data = DataBatchIterator(
-        config=config,
-        is_train=True,
-        dataset="train",
-        batch_size=config.batch_size,
-        shuffle=True)
-    train_data.load()
-
-    vocab = train_data.vocab
-
-    # 载入测试集合
-    valid_data = DataBatchIterator(
-        config=config,
-        is_train=False,
-        dataset="dev",
-        batch_size=config.batch_size)
-    valid_data.set_vocab(vocab)
-    valid_data.load()
-
-    # 构建textcnn模型
-    model = build_textcnn_model(
-        vocab, config, train=True)
-
-    print(model)
-
-    # Do training.
-    padding_idx = vocab.stoi[PAD]
-    train_textcnn_model(model, train_data,
-                        valid_data, padding_idx, config)
-    torch.save(model, '%s.pt' % (config.save_model))
-
-
-    # 测试时
-    # checkpoint = torch.load(config.save_model+".pt",
-    #                      map_location = config.device)
-    # checkpoint
-    # model = build_textcnn_model(
-    #     vocab, config, train=True)
-    # .....
-if __name__ == "__main__":
-    main()
+    # run('configs/multi_classification/fast_text_config.json')
+    # run('configs/multi_classification/text_cnn_config.json')
+    # run('configs/multi_classification/text_cnn_1d_config.json')
+    # run('configs/multi_classification/rnn_config.json')
+    # run('configs/multi_classification/lstm_config.json')
+    # run('configs/multi_classification/gru_config.json')
+    run('configs/multi_classification/rcnn_config.json')
+    # run('configs/multi_classification/rnn_attention_config.json')
+    # run('configs/multi_classification/dpcnn_config.json')
+    # run('configs/multi_classification/han_config.json')
+    # run('configs/multi_classification/xlnet_config.json')

@@ -1,0 +1,2 @@
+2020-06-28 20:49:19,122 - gensim.models.utils_any2vec - INFO - loading projection weights from data/word_embedding/sgns.sogou.char
+2020-06-28 20:51:03,722 - gensim.models.utils_any2vec - INFO - loaded (365076, 300) matrix from data/word_embedding/sgns.sogou.char
