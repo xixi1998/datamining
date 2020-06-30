@@ -1,2 +1,2 @@
 # datamining
-python cnn
+python textcnn fastText textRCNN
